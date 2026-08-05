@@ -15,6 +15,7 @@ The following types can be passed over RPC, in arguments or return values:
 - Primitive values: strings, numbers, booleans, `null`, `undefined`
 - Plain objects (e.g. from object literals)
 - Arrays
+- `Set`
 - `bigint`
 - `Date`
 - `ArrayBuffer`, `DataView`, and typed arrays
@@ -39,7 +40,7 @@ Anything passed by reference produces a **stub** on the far side, and stubs must
 
 These may be added in the future:
 
-- `Map` and `Set`
+- `Map`
 
 ## Intentionally not supported
 
