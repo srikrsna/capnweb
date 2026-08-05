@@ -883,9 +883,6 @@ export class Evaluator {
             return set;
           }
           break;
-            return set;
-          }
-          break;
         case "bytes": {
           let bytes: Uint8Array;
           // At jsonCompatibleWithBytes/structuredClonable level, bytes may already be raw.

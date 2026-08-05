@@ -1107,7 +1107,6 @@ export class RpcPayload {
           let copy = this.deepCopy(val, set, key, result, dupStubs, owner);
           defineSetPromiseSlot(result, key, copy);
           result.add(copy);
-          result.add(copy)
         }
         return result;
       }
@@ -1492,7 +1491,6 @@ export class RpcPayload {
 
       case "set": {
         let set = <Set<unknown>>value;
-        for (let element of <Set<unknown>>value) {
         for (let element of set) {
           this.disposeImpl(element, set);
         }
