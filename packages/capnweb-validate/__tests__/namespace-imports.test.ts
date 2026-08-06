@@ -44,9 +44,9 @@ import { RpcTarget } from "capnweb";
     expect(greet.returns).toBe(v.string);
   });
 
-  it("decorator: import * as cv -> @cv.validateRpc() is transformed", () => {
+  it("class: an annotated class is wrapped alongside a namespace marker call", () => {
     const { code } = transformFixture(
-      `@cv.validateRpc()
+      `// @capnweb-validate
 class Api extends RpcTarget {
   greet(name: string): string {
     return name;
@@ -57,17 +57,14 @@ export function handler(req: Request): Promise<Response> {
 }
 `,
       {
-        shim: `${CAPNWEB_SHIM}
-declare module "capnweb-validate" {
-  export function validateRpc<T = unknown>(): any;
-}`,
-        imports: `import * as cv from "capnweb-validate";
-import * as cv2 from "capnweb-validate/capnweb";
+        shim: CAPNWEB_SHIM,
+        imports: `import * as cv2 from "capnweb-validate/capnweb";
 import { RpcTarget } from "capnweb";
 `,
       },
     );
     expect(code).toContain("__cw.__validateRpcClass");
+    expect(code).toContain("__cw.__newWorkersRpcResponseWithValidation");
     const greet = checkedMethod(loadValidator(code), "greet");
     expect(greet.args[0]).toBe(v.string);
     expect(greet.returns).toBe(v.string);

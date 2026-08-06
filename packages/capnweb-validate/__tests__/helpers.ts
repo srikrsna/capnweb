@@ -25,13 +25,6 @@ declare module "capnweb-validate/capnweb" {
   export function newWorkersRpcResponse(request: Request, target: object): Promise<Response>;
 }`;
 
-/** SHIM plus the decorator markers, for @validateRpc / @skipRpcValidation tests. */
-export const DECORATOR_SHIM = `${SHIM}
-declare module "capnweb-validate" {
-  export function validateRpc<T = unknown>(): any;
-  export function skipRpcValidation(...a: unknown[]): unknown;
-}`;
-
 export type FixtureOptions = {
   /** Ambient .d.ts contents. Defaults to SHIM. */
   shim?: string;
@@ -47,6 +40,8 @@ export type FixtureOptions = {
   imports?: string;
   /** When set, append a handler returning newWorkersRpcResponse(req, <target>). */
   target?: string;
+  /** Transform options layered over the virtual context defaults. */
+  transformOptions?: Partial<TransformContextOptions>;
 };
 
 export type FixtureResult = { code: string; warns: string[] };
@@ -58,7 +53,7 @@ export type CheckedMethodSpec = Extract<
 
 export type VirtualTransformContextOptions = Pick<
   FixtureOptions,
-  "shim" | "lib" | "compilerOptions" | "files" | "rootFiles"
+  "shim" | "lib" | "compilerOptions" | "files" | "rootFiles" | "transformOptions"
 > & {
   /** Virtual worker.ts contents. */
   worker?: string;
@@ -84,7 +79,8 @@ function normalizeLibName(lib: string): string {
 function createVirtualContext(
   files: Map<string, string>,
   rootNames: string[],
-  compilerOptions: ts.CompilerOptions
+  compilerOptions: ts.CompilerOptions,
+  transformOptions: Partial<TransformContextOptions> = {}
 ): TransformContext {
   let options: ts.CompilerOptions = {
     target: ts.ScriptTarget.ES2022,
@@ -105,7 +101,10 @@ function createVirtualContext(
     host: compilerHost,
   });
   let checker = program.getTypeChecker();
-  let contextOptions: TransformContextOptions = { cwd: VIRTUAL_ROOT };
+  let contextOptions: TransformContextOptions = {
+    cwd: VIRTUAL_ROOT,
+    ...transformOptions,
+  };
 
   return {
     options: contextOptions,
@@ -147,10 +146,15 @@ export function createVirtualTransformContext(
     WORKER_PATH,
     ...(opts.rootFiles ?? []).map(virtualPath),
   ];
-  return createVirtualContext(files, rootNames, {
-    ...opts.compilerOptions,
-    lib: opts.compilerOptions?.lib ?? opts.lib ?? ["es2022", "DOM"],
-  });
+  return createVirtualContext(
+    files,
+    rootNames,
+    {
+      ...opts.compilerOptions,
+      lib: opts.compilerOptions?.lib ?? opts.lib ?? ["es2022", "DOM"],
+    },
+    opts.transformOptions
+  );
 }
 
 /**
@@ -178,6 +182,7 @@ export function transformFixture(
       compilerOptions: opts.compilerOptions,
       files: opts.files,
       rootFiles: opts.rootFiles,
+      transformOptions: opts.transformOptions,
       worker: code,
     });
     try {

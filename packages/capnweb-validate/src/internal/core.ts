@@ -708,7 +708,7 @@ export function wrapServerTarget<T extends object>(
       // `t` as receiver so a declared getter can read private state.
       let orig = Reflect.get(t, prop, t);
       if (isWrappedMethod(orig)) {
-        // Already wrapped in place by @validateRpc() on the class; don't
+        // Already wrapped in place on the class's prototype; don't
         // validate twice.
         return (orig as (...a: unknown[]) => unknown).bind(t);
       }
@@ -1297,7 +1297,7 @@ export function __validateRpcClass<T extends new (...args: any[]) => object>(
     // Wrap the declared methods in place on the class's prototype instead of
     // returning a Proxy from the constructor: workerd's native RPC serializes
     // branded RpcTargets, not Proxies; `#` fields, `instanceof`, and identity
-    // keep working; and decorated-extends-decorated composes through ordinary
+    // keep working; and validated-extends-validated composes through ordinary
     // prototype inheritance (subclass-only methods wrapped by the subclass
     // validator, inherited methods by the base's). Undeclared members are
     // left untouched; the RPC layers refuse instance properties themselves.
@@ -1311,7 +1311,7 @@ export function __validateRpcClass<T extends new (...args: any[]) => object>(
 
 /**
  * Marks prototype methods that `__validateRpcClass` has already wrapped, so
- * decorating a subclass of a decorated base (or decorating twice) never
+ * wrapping a subclass of a wrapped base (or wrapping twice) never
  * double-validates, and session wrappers can pass such methods through.
  * `Symbol.for` so duplicate bundled copies of this package recognize each
  * other's wrappers; not a security boundary (symbols never cross the wire).
@@ -1348,8 +1348,8 @@ function wrapPrototypeMethods(
     // Unchecked members (overloads, platform hooks) stay raw by design.
     if (isUncheckedMethod(methodSpec)) continue;
     // Find the implementation wherever it lives on the chain. If it's
-    // inherited from an undecorated base we shadow it with a wrapper on this
-    // prototype; if it's inherited from a decorated base it's already
+    // inherited from an unwrapped base we shadow it with a wrapper on this
+    // prototype; if it's inherited from a wrapped base it's already
     // wrapped and the base's validator governs it.
     let desc = exposedDescriptor(proto, prop);
     // Declared but implemented as an instance member (or absent): there's

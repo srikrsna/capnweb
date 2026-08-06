@@ -1,6 +1,6 @@
 # Cloudflare Workers + React example
 
-This example exposes a Cap'n Web API from a Worker and calls it from a React app. It demonstrates batched promise pipelining versus sequential requests, with server-boundary runtime validation through `@validateRpc()` and explicit client stub validation through `validateStub()`.
+This example exposes a Cap'n Web API from a Worker and calls it from a React app. It demonstrates batched promise pipelining versus sequential requests, with server-boundary runtime validation (opted in with a `// @capnweb-validate` comment) and explicit client stub validation through `validateStub()`.
 
 ## Layout
 
