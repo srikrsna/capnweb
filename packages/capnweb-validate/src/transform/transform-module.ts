@@ -3,11 +3,20 @@
 //     https://opensource.org/license/mit
 
 // Per-module transform: resolve service types, emit validators, import the
-// runtime, and rewrite marker syntax to runtime helpers.
+// runtime, rewrite marker calls to runtime helpers, and wrap annotated service
+// classes.
 
 import ts from "typescript";
 
 import { fileMatchesTransformFilters, type TransformContext } from "./context.js";
+import {
+  type Directive,
+  DIRECTIVE_TAG,
+  formatLocation,
+  IGNORE_DIRECTIVE_TAG,
+  parseSurfaceTypeNode,
+  readDirective,
+} from "./directives.js";
 import { emitValidator } from "./emit.js";
 import {
   collectPlatformMethodNames,
@@ -135,7 +144,6 @@ export function transformModule(
 
   let { bindings: markerBindings, namespaces: markerNamespaces } =
     collectMarkerBindings(sourceFile);
-  let decoratorBindings = collectDecoratorBindings(sourceFile);
 
   let callSites = collectMarkerCallSites(
     sourceFile,
@@ -143,20 +151,15 @@ export function transformModule(
     markerNamespaces,
     checker
   );
-  let decoratorSites = collectDecoratorSites(
-    sourceFile,
-    decoratorBindings,
-    markerNamespaces,
-    checker
-  );
+  let classSites = collectClassSites(sourceFile, checker);
 
-  if (callSites.length === 0 && decoratorSites.length === 0) return null;
+  if (callSites.length === 0 && classSites.length === 0) return null;
 
   let dedup = new ValidatorDedup();
   for (let site of callSites) {
     site.bindingName = dedup.bind(site.shape, site.side);
   }
-  for (let site of decoratorSites) {
+  for (let site of classSites) {
     site.bindingName = dedup.bind(site.shape, "server");
   }
 
@@ -210,15 +213,49 @@ export function transformModule(
     }
   }
 
-  for (let site of decoratorSites) {
-    edits.push({
-      start: site.decorator.expression.getStart(sourceFile),
-      end: site.decorator.expression.getEnd(),
-      text: `${RUNTIME_NAMESPACE}.__validateRpcClass(${site.bindingName!})`,
-    });
+  for (let site of classSites) {
+    edits.push(...classWrapEdits(sourceFile, site));
   }
 
   return { code: applyTextEdits(code, edits) };
+}
+
+// Apply the validator to an annotated class.
+//
+// `__validateRpcClass` wraps the prototype in place and returns the class, so
+// a statement right after the declaration is enough. That keeps the class a
+// plain declaration: its binding, `export` form, name, and hoisting are all
+// unchanged.
+function classWrapEdits(sf: ts.SourceFile, site: ClassSite): TextEdit[] {
+  let { cls, bindingName } = site;
+  let apply = `${RUNTIME_NAMESPACE}.__validateRpcClass(${bindingName!})`;
+  let end = cls.getEnd();
+  if (cls.name) {
+    return [{ start: end, end, text: `\n${apply}(${cls.name.text});` }];
+  }
+  // `export default class { ... }` has no binding to reference afterwards, so
+  // the wrapper has to take the class expression itself.
+  let classKeyword = cls
+    .getChildren(sf)
+    .find((child) => child.kind === ts.SyntaxKind.ClassKeyword);
+  // Only a default export may omit the class name, and the rewrite below
+  // depends on there being an `export default` prefix to replace.
+  if (!classKeyword || classKeyword.getStart(sf) === cls.getStart(sf)) {
+    throw buildErrorAt(
+      sf,
+      site.pos,
+      `capnweb-validate: cannot apply validation to an unnamed class. ` +
+        `Give the class a name.`
+    );
+  }
+  return [
+    {
+      start: cls.getStart(sf),
+      end: classKeyword.getStart(sf),
+      text: `export default ${apply}(`,
+    },
+    { start: end, end, text: `);` },
+  ];
 }
 
 type MarkerBinding = {
@@ -227,9 +264,9 @@ type MarkerBinding = {
 };
 
 type MarkerImports = {
-  /** Named imports: `{ validateRpc }` -> `validateRpc(...)`. */
+  /** Named imports: `{ validateStub }` -> `validateStub(...)`. */
   bindings: Map<string, MarkerBinding>;
-  /** Namespace import locals: `* as ns` -> `ns.validateRpc(...)`. */
+  /** Namespace import locals: `* as ns` -> `ns.validateStub(...)`. */
   namespaces: Set<string>;
 };
 
@@ -262,25 +299,6 @@ function collectMarkerBindings(sf: ts.SourceFile): MarkerImports {
   return { bindings, namespaces };
 }
 
-function collectDecoratorBindings(sf: ts.SourceFile): Set<string> {
-  let result = new Set<string>();
-  for (let stmt of sf.statements) {
-    if (!ts.isImportDeclaration(stmt)) continue;
-    let mod = stmt.moduleSpecifier;
-    if (!ts.isStringLiteral(mod)) continue;
-    if (mod.text !== PACKAGE_NAME && mod.text !== CAPNWEB_MARKER_PACKAGE_NAME)
-      continue;
-    let clause = stmt.importClause;
-    if (!clause?.namedBindings || !ts.isNamedImports(clause.namedBindings))
-      continue;
-    for (let spec of clause.namedBindings.elements) {
-      let imported = (spec.propertyName ?? spec.name).text;
-      if (imported === "validateRpc") result.add(spec.name.text);
-    }
-  }
-  return result;
-}
-
 type CallSite = {
   call: ts.CallExpression | ts.NewExpression;
   marker: (typeof MARKERS)[keyof typeof MARKERS];
@@ -289,9 +307,10 @@ type CallSite = {
   bindingName?: string;
 };
 
-type DecoratorSite = {
-  decorator: ts.Decorator;
+type ClassSite = {
   cls: ts.ClassDeclaration;
+  // Offset of the class's directive, which diagnostics point at.
+  pos: number;
   shape: ServiceShape;
   bindingName?: string;
 };
@@ -394,34 +413,26 @@ function pushCallSite(
         `\`${localName}(...)\`. Annotate the call with a specific RPC service type.`
     );
   }
-  rejectUnsupported(sf, call, localName, shape);
+  rejectUnsupported(sf, call.getStart(sf), shape);
   out.push({ call, marker, side: marker.side, shape });
 }
 
-function collectDecoratorSites(
+// Every class in the module that a `// @capnweb-validate` comment opts in.
+function collectClassSites(
   sf: ts.SourceFile,
-  decoratorBindings: Set<string>,
-  namespaces: Set<string>,
   checker: ts.TypeChecker
-): DecoratorSite[] {
-  let out: DecoratorSite[] = [];
-  if (decoratorBindings.size === 0 && namespaces.size === 0) return out;
-
+): ClassSite[] {
+  let out: ClassSite[] = [];
   function visit(node: ts.Node): void {
-    if (ts.isClassDeclaration(node)) {
-      for (let decorator of ts.getDecorators(node) ?? []) {
-        if (
-          !isValidateRpcDecorator(
-            decorator,
-            decoratorBindings,
-            namespaces,
-            checker
-          )
-        )
-          continue;
-        let shape = resolveDecoratorShape(sf, node, decorator, checker);
-        rejectUnsupported(sf, decorator, "validateRpc", shape);
-        out.push({ decorator, cls: node, shape });
+    // A `declare class` (or a class inside `declare module`) has no runtime
+    // prototype in this module to wrap, and its members belong to whatever
+    // implements it elsewhere.
+    if (ts.isClassDeclaration(node) && !isAmbientDeclaration(node)) {
+      let directive = readDirective(ts, sf, node);
+      if (directive?.kind === "enable") {
+        let shape = resolveAnnotatedClassShape(sf, node, directive, checker);
+        rejectUnsupported(sf, directive.pos, shape);
+        out.push({ cls: node, pos: directive.pos, shape });
       }
     }
     ts.forEachChild(node, visit);
@@ -430,58 +441,32 @@ function collectDecoratorSites(
   return out;
 }
 
-function isValidateRpcDecorator(
-  decorator: ts.Decorator,
-  bindings: Set<string>,
-  namespaces: Set<string>,
-  checker: ts.TypeChecker
-): boolean {
-  let expression = decorator.expression;
-  if (ts.isCallExpression(expression)) expression = expression.expression;
-  if (ts.isIdentifier(expression)) {
-    return (
-      bindings.has(expression.text) &&
-      resolvesToMarker(checker, expression, "validateRpc")
-    );
-  }
-  // `@ns.validateRpc()` from `import * as ns from "capnweb-validate"`.
-  return (
-    ts.isPropertyAccessExpression(expression) &&
-    ts.isIdentifier(expression.expression) &&
-    namespaces.has(expression.expression.text) &&
-    expression.name.text === "validateRpc" &&
-    resolvesToMarker(checker, expression.name, "validateRpc")
-  );
-}
-
-function resolveDecoratorShape(
+function resolveAnnotatedClassShape(
   sf: ts.SourceFile,
   cls: ts.ClassDeclaration,
-  decorator: ts.Decorator,
+  directive: Directive,
   checker: ts.TypeChecker
 ): ServiceShape {
   let classType = getClassInstanceType(cls, checker);
-  let decoratorTypeArg = getDecoratorTypeArgumentNode(decorator);
-  if (decoratorTypeArg && typeNodeContainsAny(decoratorTypeArg)) {
-    warnDecoratorAny(sf, decoratorTypeArg);
+  let surfaceNode =
+    directive.surfaceText !== undefined
+      ? parseSurfaceTypeNode(ts, sf, cls, directive)
+      : null;
+  if (surfaceNode && typeNodeContainsAny(surfaceNode)) {
+    warnSurfaceAny(sf, directive.pos);
   }
-  let signatureType = decoratorTypeArg
-    ? checker.getTypeFromTypeNode(decoratorTypeArg)
+  let signatureType = surfaceNode
+    ? checker.getTypeFromTypeNode(surfaceNode)
     : getSingleImplementedType(cls, checker);
   if (signatureType && isTooGeneric(signatureType)) {
-    throw buildError(
-      sf,
-      decorator,
-      `capnweb-validate: could not resolve a concrete service type for @validateRpc.`
-    );
+    throw unresolvableClassError(sf, cls, directive.pos);
   }
-  // Generic class with no type arg: default free params to `any` and record it
-  // so we can warn those positions are not validated. Constrained params still
-  // resolve against their constraint.
+  // Generic class with no explicit surface: default free params to `any` and
+  // record it so we can warn those positions are not validated. Constrained
+  // params still resolve against their constraint.
   let generic: GenericFallback = {
-    mode: !decoratorTypeArg && (cls.typeParameters?.length ?? 0) > 0
-      ? "any"
-      : "error",
+    mode:
+      !surfaceNode && (cls.typeParameters?.length ?? 0) > 0 ? "any" : "error",
     used: false,
   };
   let resolved = resolveServiceShape(
@@ -490,22 +475,15 @@ function resolveDecoratorShape(
     classType,
     generic,
     signatureType,
-    decoratorTypeArg ? "exact" : "sharpen"
+    surfaceNode ? "exact" : "sharpen"
   );
-  if (resolved === null) {
-    throw buildError(
-      sf,
-      decorator,
-      `capnweb-validate: could not resolve a concrete service type for @validateRpc.`
-    );
-  }
-  if (generic.used) {
-    warnGenericDefaultedToAny(sf, cls, decorator);
-  }
+  if (resolved === null) throw unresolvableClassError(sf, cls, directive.pos);
+  if (generic.used) warnGenericDefaultedToAny(sf, cls, directive.pos);
+
   let shape = cloneServiceShape(resolved);
-  let skipped = collectClassSkipRpcValidationMethods(cls, checker);
+  let skipped = collectClassIgnoreDirectives(cls);
   if (skipped.size > 0) {
-    rejectSkippedMethodsOutsideSurface(sf, cls, shape, skipped);
+    rejectIgnoresOutsideSurface(sf, cls, shape, skipped);
     shape = applySkippedMethods(shape, skipped);
   }
   if (isWorkerEntrypointType(checker, classType)) {
@@ -514,12 +492,36 @@ function resolveDecoratorShape(
   return applyPlatformPassthrough(checker, classType, shape);
 }
 
-function getDecoratorTypeArgumentNode(
-  decorator: ts.Decorator
-): ts.TypeNode | null {
-  let expression = decorator.expression;
-  if (!ts.isCallExpression(expression)) return null;
-  return expression.typeArguments?.[0] ?? null;
+function isAmbientDeclaration(node: ts.Declaration): boolean {
+  if (hasDeclareModifier(node)) return true;
+  // A class inside `declare module "x" { ... }` carries no `declare` modifier
+  // of its own, so check the enclosing module blocks too.
+  for (let p: ts.Node | undefined = node.parent; p; p = p.parent) {
+    if (ts.isModuleDeclaration(p) && hasDeclareModifier(p)) return true;
+  }
+  return false;
+}
+
+function hasDeclareModifier(node: ts.Node): boolean {
+  return (
+    ts.canHaveModifiers(node) &&
+    (ts.getModifiers(node) ?? []).some(
+      (modifier) => modifier.kind === ts.SyntaxKind.DeclareKeyword
+    )
+  );
+}
+
+function unresolvableClassError(
+  sf: ts.SourceFile,
+  cls: ts.ClassDeclaration,
+  pos: number
+): Error {
+  return buildErrorAt(
+    sf,
+    pos,
+    `capnweb-validate: could not resolve a concrete RPC surface for ` +
+      `\`${cls.name?.text ?? "the annotated class"}\`.`
+  );
 }
 
 function typeNodeContainsAny(node: ts.TypeNode): boolean {
@@ -539,27 +541,24 @@ function typeNodeContainsAny(node: ts.TypeNode): boolean {
 function warnGenericDefaultedToAny(
   sf: ts.SourceFile,
   cls: ts.ClassDeclaration,
-  decorator: ts.Decorator
+  pos: number
 ): void {
-  let { line, character } = sf.getLineAndCharacterOfPosition(
-    decorator.getStart(sf)
-  );
   let name = cls.name?.text ?? "class";
   console.warn(
-    `${sf.fileName}:${line + 1}:${character + 1}: capnweb-validate: ` +
+    `${formatLocation(sf, pos)}: capnweb-validate: ` +
       `\`${name}\` is generic; unconstrained type parameters default to ` +
-      `\`any\` and are not runtime-validated. Pass a concrete type argument ` +
-      `(e.g. @validateRpc<${name}<string>>()) or constrain the parameter ` +
-      `(\`<T extends ...>\`) to validate those positions.`
+      `\`any\` and are not runtime-validated. Give an explicit RPC surface ` +
+      `(e.g. \`// ${DIRECTIVE_TAG} {${name}<string>}\`) or constrain the ` +
+      `parameter (\`<T extends ...>\`) to validate those positions.`
   );
 }
-function warnDecoratorAny(sf: ts.SourceFile, node: ts.TypeNode): void {
-  let { line, character } = sf.getLineAndCharacterOfPosition(node.getStart(sf));
+
+function warnSurfaceAny(sf: ts.SourceFile, pos: number): void {
   console.warn(
-    `${sf.fileName}:${line + 1}:${character + 1}: capnweb-validate: ` +
-      `@validateRpc type argument contains \`any\`; generic content at ` +
-      `that position is not runtime-validated. Use a concrete surface type ` +
-      `if that boundary needs full validation.`
+    `${formatLocation(sf, pos)}: capnweb-validate: ` +
+      `the \`${DIRECTIVE_TAG}\` surface type contains \`any\`; generic ` +
+      `content at that position is not runtime-validated. Use a concrete ` +
+      `surface type if that boundary needs full validation.`
   );
 }
 
@@ -604,29 +603,32 @@ function cloneServiceShape(shape: ServiceShape): ServiceShape {
   };
 }
 
-function rejectSkippedMethodsOutsideSurface(
+// An ignore that names something outside the resolved RPC surface is almost
+// always a typo or a stale annotation, and silently dropping it would leave
+// the user believing a boundary is unchecked when it is still validated.
+function rejectIgnoresOutsideSurface(
   sf: ts.SourceFile,
   cls: ts.ClassDeclaration,
   shape: ServiceShape,
-  skipped: Map<string, ts.Decorator>
+  skipped: Map<string, number>
 ): void {
   let surfaceMethods = new Set(shape.methods.map((method) => method.name));
   let className = cls.name?.text ?? "<anonymous>";
-  for (let [name, decorator] of skipped) {
+  for (let [name, pos] of skipped) {
     if (surfaceMethods.has(name)) continue;
-    throw buildError(
+    throw buildErrorAt(
       sf,
-      decorator,
-      `capnweb-validate: @skipRpcValidation() on ${className}.${name} ` +
+      pos,
+      `capnweb-validate: \`${IGNORE_DIRECTIVE_TAG}\` on ${className}.${name} ` +
         `does not match a method in the resolved RPC surface ${shape.name}. ` +
-        `@skipRpcValidation() only applies to methods in the RPC surface.`
+        `\`${IGNORE_DIRECTIVE_TAG}\` only applies to methods in the RPC surface.`
     );
   }
 }
 
 function applySkippedMethods(
   shape: ServiceShape,
-  skipped: Map<string, ts.Decorator>
+  skipped: Map<string, number>
 ): ServiceShape {
   return {
     ...shape,
@@ -638,30 +640,30 @@ function applySkippedMethods(
   };
 }
 
-function collectClassSkipRpcValidationMethods(
-  cls: ts.ClassDeclaration,
-  checker: ts.TypeChecker
-): Map<string, ts.Decorator> {
-  let skipped = new Map<string, ts.Decorator>();
+// Members of `cls` carrying `// @capnweb-validate-ignore`, by name, with the
+// offset of the directive for diagnostics.
+function collectClassIgnoreDirectives(
+  cls: ts.ClassDeclaration
+): Map<string, number> {
+  let sf = cls.getSourceFile();
+  let skipped = new Map<string, number>();
   for (let member of cls.members) {
-    if (!ts.isMethodDeclaration(member)) continue;
-    let name = methodName(member.name);
-    if (!name) continue;
-    for (let decorator of ts.getDecorators(member) ?? []) {
-      let expression = decorator.expression;
-      if (ts.isCallExpression(expression)) expression = expression.expression;
-      if (!ts.isIdentifier(expression)) continue;
-      let sym = checker.getSymbolAtLocation(expression);
-      if (sym && sym.flags & ts.SymbolFlags.Alias) {
-        sym = checker.getAliasedSymbol(sym);
-      }
-      if (
-        sym?.getName() === "skipRpcValidation" &&
-        isCapnwebValidateSymbol(sym)
-      ) {
-        skipped.set(name, decorator);
-      }
+    let directive = readDirective(ts, sf, member);
+    if (!directive) continue;
+    if (directive.kind === "enable") {
+      throw buildErrorAt(
+        sf,
+        directive.pos,
+        `capnweb-validate: \`${DIRECTIVE_TAG}\` opts in an entire class, so ` +
+          `it belongs on the class declaration, not on one of its members. ` +
+          `Use \`${IGNORE_DIRECTIVE_TAG}\` to opt a single method out.`
+      );
     }
+    // `#private`, computed, and symbol-named members are never in the RPC
+    // surface, so an opt-out on one is already true.
+    let name = member.name ? methodName(member.name) : null;
+    if (!name) continue;
+    skipped.set(name, directive.pos);
   }
   return skipped;
 }
@@ -674,23 +676,22 @@ function methodName(name: ts.PropertyName): string | null {
 
 function rejectUnsupported(
   sf: ts.SourceFile,
-  node: ts.Node,
-  _label: string,
+  pos: number,
   shape: ServiceShape
 ): void {
   let bad = collectUnsupported(shape);
   if (bad.length === 0) return;
   if (bad.length === 1) {
-    throw buildError(
+    throw buildErrorAt(
       sf,
-      node,
+      pos,
       `capnweb-validate: ${formatUnsupportedIssue(bad[0]!)}`
     );
   }
   let detail = bad.map((b) => `  - ${formatUnsupportedIssue(b)}`).join("\n");
-  throw buildError(
+  throw buildErrorAt(
     sf,
-    node,
+    pos,
     `capnweb-validate: \`${shape.name}\` references types that ` +
       `capnweb-validate cannot validate:\n${detail}`
   );
@@ -930,6 +931,9 @@ function sortedEntries(properties: Record<string, TypeShape>): unknown[] {
 }
 
 function buildError(sf: ts.SourceFile, node: ts.Node, message: string): Error {
-  let { line, character } = sf.getLineAndCharacterOfPosition(node.getStart(sf));
-  return new Error(`${sf.fileName}:${line + 1}:${character + 1}: ${message}`);
+  return buildErrorAt(sf, node.getStart(sf), message);
+}
+
+function buildErrorAt(sf: ts.SourceFile, pos: number, message: string): Error {
+  return new Error(`${formatLocation(sf, pos)}: ${message}`);
 }

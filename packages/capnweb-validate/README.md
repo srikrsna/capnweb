@@ -3,12 +3,11 @@
 Build-time runtime validation for Cap'n Web and Workers RPC services.
 
 `capnweb-validate` keeps TypeScript method signatures as the source of
-truth. Add `@validateRpc()` to the service class; a bundler plugin or CLI
-rewrites the decorator and injects validators generated from the resolved
-TypeScript types.
+truth. A bundler plugin or CLI generates validators from the resolved
+TypeScript types and applies them to your service classes.
 
-If a validation decorator is left untransformed, it throws with a configuration
-error instead of silently running without validation.
+Validation is opt in. Mark a service class with a `// @capnweb-validate`
+comment and its methods are checked.
 
 ## Install
 
@@ -24,11 +23,10 @@ helpers live under `capnweb-validate/capnweb` and internal transform outputs.
 
 ```ts
 import { newWorkersRpcResponse, RpcTarget } from "capnweb";
-import { validateRpc } from "capnweb-validate";
 
 type User = { id: string; name: string };
 
-@validateRpc()
+// @capnweb-validate
 export class Api extends RpcTarget {
   async authenticate(sessionToken: string): Promise<User> {
     // ...
@@ -42,28 +40,56 @@ export default {
 };
 ```
 
-`@validateRpc()` validates calls on class instances, so it works with Cap'n Web,
-Workers `WorkerEntrypoint`, and Workers `DurableObject` services.
+Validation applies to class instances, so it works with Cap'n Web, Workers
+`WorkerEntrypoint`, and Workers `DurableObject` services alike.
 
-With no explicit type argument, the RPC surface is the class's public
-string-named methods and RPC-readable getters/properties, matching Cap'n Web
-dispatch. `implements SomeInterface` can sharpen matching signatures, but it
-does not hide extra public class methods. Keep local-only helpers private or
-symbol-named.
+The RPC surface is the class's public string-named methods and RPC-readable
+getters/properties, matching Cap'n Web dispatch. `implements SomeInterface` can
+sharpen matching signatures, but it does not hide extra public class methods.
+Keep local-only helpers private or symbol-named.
 
-An explicit `@validateRpc<SomeInterface>()` makes `SomeInterface` the RPC
-surface. Public class methods outside that interface are rejected over RPC.
+## Comment directives
+
+| Comment | Where | Effect |
+| ------- | ----- | ------ |
+| `// @capnweb-validate` | class | Validate this class. |
+| `// @capnweb-validate {Surface}` | class | Validate this class against `Surface` as the exact RPC surface. |
+| `// @capnweb-validate-ignore` | method | Pass this method through unvalidated. |
+
+Directives are read from a declaration's leading comments, so `//` and JSDoc
+`/** ... */` both work:
+
+```ts
+/** Public API. @capnweb-validate */
+export class Api extends RpcTarget {
+  // ...
+}
+```
+
+An explicit `{Surface}` makes that type the RPC surface. Public class methods
+outside it are rejected over RPC:
+
+```ts
+// @capnweb-validate {PublicApi}
+export class Api extends RpcTarget implements PublicApi, InternalApi {
+  // Only `PublicApi` members are callable over RPC.
+}
+```
+
+An ignore naming a member that is not in the resolved RPC surface is a build
+error rather than a silent no-op, so a typo or a stale annotation cannot leave
+you believing a boundary is unchecked when it is still validated.
 
 ## Generic service classes
 
-A decorator emits one validator at the class declaration. If the class itself
-is generic, the transform cannot specialize that validator for each later
-`new` expression.
+One validator is emitted at the class declaration. If the class itself is
+generic, the transform cannot specialize that validator for each later `new`
+expression.
 
-Use an explicit RPC surface when type arguments are known at the decorator site:
+Use an explicit RPC surface when the type arguments are known at the class:
 
 ```ts
-@validateRpc<Gatekeeper<GmailSession, number, undefined>>()
+// @capnweb-validate {Gatekeeper<GmailSession, number, undefined>}
 class GmailGatekeeper
   extends RpcTarget
   implements Gatekeeper<GmailSession, number, undefined> {
@@ -71,21 +97,23 @@ class GmailGatekeeper
 }
 ```
 
+The surface type is resolved in the class's own scope, so imports, local type
+aliases, and the class's type parameters are all usable.
+
 A generic implementation class needs no annotation. An unconstrained type
 parameter defaults to `any` with a warning; a constrained parameter validates
 against its constraint:
 
 ```ts
-@validateRpc()
 class ArrayCursor<T> extends RpcTarget implements Cursor<T> {
   // `T` defaults to `any` (warned). `<T extends Session>` would validate
   // those positions against `Session`.
 }
 ```
 
-Pass `@validateRpc<Cursor<string>>()` to validate the `Cursor<string>` surface,
-or `@validateRpc<Cursor<any>>()` to silence the warning while keeping `Cursor`
-positions permissive.
+Use `// @capnweb-validate {Cursor<string>}` to validate the `Cursor<string>`
+surface, or `// @capnweb-validate {Cursor<any>}` to silence the warning while
+keeping `Cursor` positions permissive.
 
 ## Client Usage
 
@@ -141,6 +169,15 @@ export default {
 The plugin transforms matching modules in memory; user source files are not
 modified on disk.
 
+Options:
+
+- `tsconfig` — path to the `tsconfig.json` defining the program. Defaults to
+  the nearest one above `cwd`.
+- `include` / `exclude` — glob lists layered on top of the TypeScript root
+  names.
+- `cwd` — defaults to `process.cwd()`.
+- `serverValidation` — `"throw"` (default) or `"warn"`.
+
 ## CLI
 
 Wrangler does not expose a bundler plugin hook. For Wrangler, CI, or any flow
@@ -155,21 +192,21 @@ Options:
 - `--out <dir>` writes the transformed source tree. Required.
 - `--tsconfig <path>` defaults to `./tsconfig.json`.
 - `--cwd <dir>` defaults to `process.cwd()`.
+- `--server-validation <throw|warn>` defaults to `throw`.
 
 Point the downstream build tool at the generated entry under `--out`.
 
 ## Opting out per method
 
-Use `@skipRpcValidation()` when one RPC method should not get generated
+Use `// @capnweb-validate-ignore` when one RPC method should not get generated
 argument or return validators:
 
 ```ts
 import { RpcTarget } from "capnweb";
-import { skipRpcValidation, validateRpc } from "capnweb-validate";
 
-@validateRpc()
+// @capnweb-validate
 class Api extends RpcTarget {
-  @skipRpcValidation()
+  // @capnweb-validate-ignore
   unsafe(payload: unknown): unknown {
     return payload;
   }
@@ -264,8 +301,8 @@ lowered type graph exceeds the internal resolution depth limit, it fails with
 An overloaded method exposes several call signatures; validating against one
 would reject valid calls to the others. Overloaded methods are passed through
 unvalidated with a warning. Collapse the overloads into a single signature with
-union parameters to validate the method, or `@skipRpcValidation()` to silence
-the warning.
+union parameters to validate the method, or `// @capnweb-validate-ignore` to
+silence the warning.
 
 ## Schema Evolution
 

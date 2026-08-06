@@ -2,7 +2,7 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-// Cap'n Web-specific runtime helpers. The decorator runtime lives in
+// Cap'n Web-specific runtime helpers. The class-wrapping runtime lives in
 // ./core.ts and intentionally has no capnweb dependency.
 
 import * as capnweb from "capnweb";
