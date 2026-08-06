@@ -1,23 +1,22 @@
-// Free class type params the decorator can't specialize: unconstrained defaults to any (warn), constrained validates the constraint, generic methods still error.
+// Free class type params an annotation can't specialize: unconstrained defaults to any (warn), constrained validates the constraint, generic methods still error.
 import { describe, it, expect } from "vitest";
 import {
   accepts,
   checkedMethod,
-  DECORATOR_SHIM,
   loadValidator,
+  SHIM,
   transformFixture,
   validatorShape,
 } from "./helpers.js";
 import { v, wrapServerTarget, type ServiceValidator } from "../src/internal/core.js";
 
 const IMPORTS = `import { newWorkersRpcResponse } from "capnweb-validate/capnweb";
-import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import { RpcTarget } from "capnweb";
 `;
 
 function compile(body: string, ctor?: string): { code: string | null; warns: string[]; error?: string } {
   try {
-    const { code, warns } = transformFixture(body, { shim: DECORATOR_SHIM, imports: IMPORTS, target: ctor });
+    const { code, warns } = transformFixture(body, { shim: SHIM, imports: IMPORTS, target: ctor });
     return { code, warns };
   } catch (e) {
     return { code: null, warns: [], error: e instanceof Error ? e.message : String(e) };
@@ -40,7 +39,7 @@ describe("generic service classes", () => {
       `interface A {
   a(): Promise<string>;
 }
-@validateRpc()
+// @capnweb-validate
 class Api extends RpcTarget implements A {
   async a(): Promise<string> {
     return "";
@@ -62,7 +61,7 @@ class Api extends RpcTarget implements A {
       `interface A {
   a(x: string): Promise<string>;
 }
-@validateRpc()
+// @capnweb-validate
 class Api extends RpcTarget implements A {
   async a(x: any): Promise<any> {
     return x;
@@ -87,7 +86,7 @@ class Api extends RpcTarget implements A {
       `interface Cursor<T> {
   next(): Promise<T>;
 }
-@validateRpc()
+// @capnweb-validate
 class Api<T> extends RpcTarget implements Cursor<T> {
   async next(): Promise<T> {
     return null as any;
@@ -103,7 +102,7 @@ class Api<T> extends RpcTarget implements Cursor<T> {
       `interface Cursor<T> {
   next(): Promise<T>;
 }
-@validateRpc()
+// @capnweb-validate
 class Api<T extends { id: string }> extends RpcTarget implements Cursor<T> {
   async next(): Promise<T> {
     return null as any;
@@ -116,12 +115,12 @@ class Api<T extends { id: string }> extends RpcTarget implements Cursor<T> {
     expect(warns.join("")).not.toContain("unconstrained");
   });
 
-  it("uses an explicit decorator type argument as the RPC surface", () => {
+  it("uses an explicit `{Surface}` directive as the RPC surface", () => {
     const { validator, warns } = compileValidator(
       `interface Cursor<T> {
   next(): Promise<T>;
 }
-@validateRpc<Cursor<string>>()
+// @capnweb-validate {Cursor<string>}
 class Api<T> extends RpcTarget implements Cursor<T> {
   async next(): Promise<T> {
     return null as any;
@@ -146,7 +145,7 @@ class Api<T> extends RpcTarget implements Cursor<T> {
       `interface Sig {
   config(): Promise<string>;
 }
-@validateRpc<Sig>()
+// @capnweb-validate {Sig}
 class Api extends RpcTarget {
   get config(): Promise<string> {
     return Promise.resolve("ok");
@@ -163,7 +162,7 @@ class Api extends RpcTarget {
       `interface Sig {
   value: string;
 }
-@validateRpc<Sig>()
+// @capnweb-validate {Sig}
 class Api extends RpcTarget {
   value(): string {
     return "ok";
@@ -181,7 +180,7 @@ class Api extends RpcTarget {
   foo(): Promise<string>;
   foo(x: string): Promise<string>;
 }
-@validateRpc<Sig>()
+// @capnweb-validate {Sig}
 class Api extends RpcTarget {
   async foo(x?: any): Promise<any> {
     return "";
@@ -197,9 +196,9 @@ class Api extends RpcTarget {
   foo(x: string): Promise<string>;
   foo(x: number): Promise<number>;
 }
-@validateRpc<Sig>()
+// @capnweb-validate {Sig}
 class Api extends RpcTarget {
-  @skipRpcValidation()
+  // @capnweb-validate-ignore
   async foo(x: any): Promise<any> {
     return x;
   }
@@ -215,7 +214,7 @@ class Api extends RpcTarget {
   extra(): Promise<string>;
   extra(x: string): Promise<string>;
 }
-@validateRpc<Sig>()
+// @capnweb-validate {Sig}
 class Api extends RpcTarget {
   ok(): string {
     return "ok";
@@ -232,7 +231,7 @@ class Api extends RpcTarget {
   field(): Promise<string>;
   field(x: string): Promise<string>;
 }
-@validateRpc<Sig>()
+// @capnweb-validate {Sig}
 class Api extends RpcTarget {
   field = 1;
   ok(): string {
@@ -250,7 +249,7 @@ class Api extends RpcTarget {
   foo(): Promise<string>;
   foo(x: string): Promise<string>;
 }
-@validateRpc<Sig>()
+// @capnweb-validate {Sig}
 class Api extends RpcTarget {
   get foo(): Promise<string> {
     return Promise.resolve("ok");
@@ -274,7 +273,7 @@ interface Peer {
   a(): Promise<string>;
   peer(p: RpcStub<Sig>): Promise<void>;
 }
-@validateRpc<Peer>()
+// @capnweb-validate {Peer}
 class Api extends RpcTarget {
   a(): Promise<string> {
     return Promise.resolve("");
@@ -301,7 +300,7 @@ class Api extends RpcTarget {
 interface B {
   b(): Promise<number>;
 }
-@validateRpc()
+// @capnweb-validate
 class Api extends RpcTarget implements A, B {
   async a(): Promise<string> {
     return "";
@@ -318,7 +317,7 @@ class Api extends RpcTarget implements A, B {
 
   it("still errors on a generic method, because no class type argument can fix it", () => {
     const { code, error } = compile(
-      `@validateRpc()
+      `// @capnweb-validate
 class Api extends RpcTarget {
   async get<T>(x: T): Promise<T> {
     return null as any;

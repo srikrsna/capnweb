@@ -56,7 +56,6 @@ declare module "cloudflare:workers" {
   }
 }
 declare module "capnweb-validate" {
-  export function validateRpc(...args: unknown[]): unknown;
   export function validateStub<T>(stub: object): unknown;
 }
 declare module "capnweb-validate/capnweb" {
@@ -209,25 +208,21 @@ describe("transformModule", () => {
     }
   });
 
-  it("does not rewrite a decorator binding that shadows the marker name", () => {
+  it("leaves a class alone when it opts out with @capnweb-validate-ignore", () => {
     let code = `
-      import { validateRpc } from "capnweb-validate";
       import { RpcTarget } from "capnweb";
-      function make(validateRpc: () => unknown) {
-        @validateRpc()
-        class Api extends RpcTarget {
-          echo(value: string): string {
-            return value;
-          }
+      // @capnweb-validate-ignore
+      export class Api extends RpcTarget {
+        echo(value: string): string {
+          return value;
         }
-        return Api;
       }
-      export const Api = make(() => (x: unknown) => x);
     `;
     let ctx = createVirtualTransformContext({ shim: CAPNWEB_SHIM, worker: code });
     try {
       let id = [...ctx.listSourceFiles()].find((file) => file.endsWith("/worker.ts"));
       expect(id).toBeDefined();
+      // Nothing else in the module needs a rewrite, so the transform no-ops.
       expect(transformModule(ctx, id!, code)).toBeNull();
     } finally {
       ctx.dispose();
@@ -305,11 +300,10 @@ describe("transformModule", () => {
     expect(code).toContain(`__cw.__newWorkersRpcResponseWithValidation(req, new Api(), __capnweb_validate_Api_server)`);
   });
 
-  it("decorator: rewrites @validateRpc to wrap the class", () => {
+  it("class: rewrites an annotated class to apply the validator", () => {
     let { code } = transform(`
-      import { validateRpc } from "capnweb-validate";
       import { RpcTarget } from "capnweb";
-      @validateRpc()
+      // @capnweb-validate
       class Api extends RpcTarget {
         greet(name: string): string {
           return name;
@@ -323,11 +317,10 @@ describe("transformModule", () => {
     expect(greet.returns).toBe(v.string);
   });
 
-  it("decorator: filters inherited WorkerEntrypoint platform methods", () => {
+  it("class: filters inherited WorkerEntrypoint platform methods", () => {
     let { code } = transform(`
       import { WorkerEntrypoint } from "cloudflare:workers";
-      import { validateRpc } from "capnweb-validate";
-      @validateRpc()
+      // @capnweb-validate
       class Api extends WorkerEntrypoint {
         rpc(x: string): Promise<string> {
           return null as any;
@@ -344,11 +337,10 @@ describe("transformModule", () => {
     );
   });
 
-  it("decorator: filters overridden WorkerEntrypoint platform methods", () => {
+  it("class: filters overridden WorkerEntrypoint platform methods", () => {
     let { code } = transform(`
       import { WorkerEntrypoint } from "cloudflare:workers";
-      import { validateRpc } from "capnweb-validate";
-      @validateRpc()
+      // @capnweb-validate
       class Api extends WorkerEntrypoint {
         fetch(request: Request): Response {
           return new Response(request.url);
@@ -365,7 +357,7 @@ describe("transformModule", () => {
   });
 
   // The server-marker path did no platform filtering before this change. Assert
-  // parity with the decorator path for both an inherited hook and `connect`.
+  // parity with the annotated-class path for both an inherited hook and `connect`.
   it.each([
     ["WorkerEntrypoint", "tailStream"],
     ["DurableObject", "alarm"],
@@ -447,11 +439,10 @@ describe("transformModule", () => {
     expect(validator.passthrough).toBeUndefined();
   });
 
-  it("decorator: filters inherited DurableObject platform methods", () => {
+  it("class: filters inherited DurableObject platform methods", () => {
     let { code } = transform(`
       import { DurableObject } from "cloudflare:workers";
-      import { validateRpc } from "capnweb-validate";
-      @validateRpc()
+      // @capnweb-validate
       class Api extends DurableObject {
         rpc(x: string): Promise<string> {
           return null as any;

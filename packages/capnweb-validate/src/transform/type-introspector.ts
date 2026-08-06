@@ -93,6 +93,20 @@ export type TypeShape =
       fixHint?: string;
     };
 
+export type ResolveServiceOptions = {
+  // How to treat unconstrained generic parameters. Defaults to "error".
+  generic?: GenericFallback;
+  // Sharper signature source (an `implements` clause or an explicit surface).
+  signatureType?: ts.Type | null;
+  // "sharpen" adopts matching signatures from `signatureType`; "exact" also
+  // restricts the surface to `signatureType`'s members.
+  signatureMode?: "sharpen" | "exact";
+  // Members the caller has opted out of validation. They are emitted as
+  // pass-through so their types are never lowered, never warn, and never fail
+  // the build.
+  isSkippedMember?: (prop: ts.Symbol) => boolean;
+};
+
 /**
  * Resolve the service type at a marker call site to a {@link ServiceShape}.
  * Returns null if it is not a concrete object; callers raise a build error.
@@ -101,15 +115,20 @@ export function resolveServiceShape(
   tsm: typeof ts,
   checker: ts.TypeChecker,
   type: ts.Type,
-  generic?: GenericFallback,
-  signatureType?: ts.Type | null,
-  signatureMode: "sharpen" | "exact" = "sharpen"
+  options: ResolveServiceOptions
 ): ServiceShape | null {
-  let ctx = createResolveContext(tsm, checker, generic);
+  let { generic, signatureType, signatureMode = "sharpen" } = options;
+  let ctx = createResolveContext(
+    tsm,
+    checker,
+    generic,
+    options.isSkippedMember
+  );
   if (!signatureType) return resolveServiceShapeInner(ctx, type);
   // `type` provides the runtime implementation. `signatureType` can either
-  // sharpen matching members (`implements T`) or, for explicit
-  // `@validateRpc<T>()`, also filter the exposed method set to T's names.
+  // sharpen matching members (`implements T`) or, for an explicit
+  // `@capnweb-validate {T}` surface, also filter the exposed method set to T's
+  // names.
   let surfaceKinds = collectServiceSurfaceNames(ctx, type);
   let signature = resolveServiceShapeInner(
     ctx,
@@ -127,12 +146,12 @@ export function resolveServiceShape(
 }
 
 // Resolve `type` into a ServiceShape. Two optional modes support the
-// decorator's "class surface + signature source" split:
+// annotated class's "class surface + signature source" split:
 // - `methodOverrides`: replace a resolved member with a precomputed shape when
 //   the names match. Used by the final class pass to adopt sharper signatures.
 // - `includeMethods`: restrict resolution to these surface names (the signature
-//   pass, or explicit `@validateRpc<T>()`), so members outside the active
-//   surface never warn, error, or emit named shapes.
+//   pass, or an explicit `@capnweb-validate {T}` surface), so members outside
+//   the active surface never warn, error, or emit named shapes.
 // Both modes bypass the service cache so the filtered/overridden shape is never
 // observed by an unrelated resolution of the same `type`.
 function resolveServiceShapeInner(
@@ -182,7 +201,7 @@ function resolveServiceShapeInner(
     if (propName.startsWith("#")) continue; // private fields
     if (propName === "constructor") continue;
     if (includeMethods && !includeMethods.has(propName)) continue;
-    if (hasSkipRpcValidationDecorator(ctx, prop)) {
+    if (ctx.isSkippedMember?.(prop)) {
       service.methods.push({ name: prop.getName(), skipValidation: true });
       continue;
     }
@@ -294,7 +313,7 @@ function collectServiceSurfaceNames(
     if (decl && isPrivateOrProtected(tsm, decl)) continue;
     if (propName.startsWith("#")) continue;
     if (propName === "constructor") continue;
-    if (hasSkipRpcValidationDecorator(ctx, prop)) continue;
+    if (ctx.isSkippedMember?.(prop)) continue;
     let propType = decl
       ? ctx.checker.getTypeOfSymbolAtLocation(prop, decl)
       : ctx.checker.getTypeOfSymbol(prop);
@@ -322,9 +341,9 @@ type ResolveEntry = {
 };
 
 /**
- * How to handle an unconstrained generic parameter: "any" (decorator path on a
- * generic class) or "error" everywhere else. `used` fires when a default applies,
- * so the caller warns only when it matters.
+ * How to handle an unconstrained generic parameter: "any" (annotated generic
+ * class) or "error" everywhere else. `used` fires when a default applies, so
+ * the caller warns only when it matters.
  */
 export type GenericFallback = { mode: "error" | "any"; used: boolean };
 
@@ -336,12 +355,14 @@ type ResolveContext = {
   nextId: number;
   services: WeakMap<ts.Type, { shape: ServiceShape; resolving: boolean }>;
   generic: GenericFallback;
+  isSkippedMember?: (prop: ts.Symbol) => boolean;
 };
 
 function createResolveContext(
   tsm: typeof ts,
   checker: ts.TypeChecker,
-  generic: GenericFallback = { mode: "error", used: false }
+  generic: GenericFallback = { mode: "error", used: false },
+  isSkippedMember?: (prop: ts.Symbol) => boolean
 ): ResolveContext {
   return {
     tsm,
@@ -351,6 +372,7 @@ function createResolveContext(
     nextId: 0,
     services: new WeakMap(),
     generic,
+    ...(isSkippedMember ? { isSkippedMember } : {}),
   };
 }
 
@@ -373,8 +395,8 @@ function isPrivateOrProtected(tsm: typeof ts, decl: ts.Declaration): boolean {
   return false;
 }
 
-// Decorator and call-site paths resolve the same type, so dedup the warning on
-// the declaration node (a watch rebuild produces fresh nodes).
+// Annotated-class and call-site paths resolve the same type, so dedup the
+// warning on the declaration node (a watch rebuild produces fresh nodes).
 const warnedOverloads = new WeakSet<ts.Declaration>();
 
 function warnOverloadedMethod(name: string, decl: ts.Declaration): void {
@@ -386,35 +408,9 @@ function warnOverloadedMethod(name: string, decl: ts.Declaration): void {
     `${sf.fileName}:${line + 1}:${character + 1}: capnweb-validate: ` +
       `method \`${name}\` is overloaded; capnweb-validate checks one ` +
       `signature only, so it is passed through unvalidated. Use a single ` +
-      `signature with union parameters to validate it, or @skipRpcValidation() ` +
-      `to silence this.`
+      `signature with union parameters to validate it, or a ` +
+      `\`// @capnweb-validate-ignore\` comment to silence this.`
   );
-}
-
-function hasSkipRpcValidationDecorator(
-  ctx: ResolveContext,
-  prop: ts.Symbol
-): boolean {
-  for (let decl of prop.declarations ?? []) {
-    let tsm = ctx.tsm;
-    if (!tsm.canHaveDecorators?.(decl)) continue;
-    for (let decorator of tsm.getDecorators?.(decl) ?? []) {
-      let expression = decorator.expression;
-      if (tsm.isCallExpression(expression)) expression = expression.expression;
-      if (!tsm.isIdentifier(expression)) continue;
-      let sym = ctx.checker.getSymbolAtLocation(expression);
-      if (sym && sym.flags & tsm.SymbolFlags.Alias) {
-        sym = ctx.checker.getAliasedSymbol(sym);
-      }
-      if (
-        sym?.getName() === "skipRpcValidation" &&
-        isCapnwebValidateSymbol(sym)
-      ) {
-        return true;
-      }
-    }
-  }
-  return false;
 }
 
 function unwrapPromise(
@@ -617,7 +613,7 @@ function resolveType(ctx: ResolveContext, type: ts.Type, depth = 0): TypeShape {
         return resolveType(ctx, constraint, depth + 1);
       }
     }
-    // Unconstrained: default to `any` (decorator path) or fail (see GenericFallback).
+    // Unconstrained: default to `any` (annotated class) or fail (see GenericFallback).
     if (ctx.generic.mode === "any") {
       ctx.generic.used = true;
       return { kind: "any" };
@@ -787,7 +783,7 @@ function resolveType(ctx: ResolveContext, type: ts.Type, depth = 0): TypeShape {
       reason: "a conditional type that does not resolve to a concrete type",
       fixHint:
         "pass a concrete type argument (e.g. a non-generic method, or " +
-        "@validateRpc<Service<ConcreteType>>()) so the type resolves",
+        "`// @capnweb-validate {Service<ConcreteType>}`) so the type resolves",
     };
   }
   return { kind: "unsupported", reason: `unsupported type (flags=${flags})` };

@@ -1,5 +1,4 @@
 import { newWorkersRpcResponse, RpcTarget } from 'capnweb';
-import { validateRpc } from 'capnweb-validate';
 
 type User = { id: string; name: string };
 type Profile = { id: string; bio: string };
@@ -30,7 +29,9 @@ const NOTIFICATIONS = new Map<string, string[]>([
   ['u_2', ['New feature: pipelining!', 'Security tips for your account']],
 ]);
 
-@validateRpc()
+// `// @capnweb-validate` opts this class into generated validation. Add
+// `// @capnweb-validate-ignore` on a method to pass it through unchecked.
+// @capnweb-validate
 export class Api extends RpcTarget {
   constructor(private env: Env) { super(); }
 

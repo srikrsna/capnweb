@@ -2,13 +2,13 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-// Runtime behavior of `__validateRpcClass` (the runtime half of
-// `@validateRpc()`). The decorator must wrap declared methods in place on the
-// class's prototype rather than Proxy-wrapping instances: native (workerd)
-// RPC refuses Proxy targets, and a decorated subclass of a decorated base
-// must resolve subclass-only methods against the subclass validator.
-// Regression tests for the GitHubPullRequestImpl-extends-GitHubIssueImpl
-// failure ("X is not in the generated validator").
+// Runtime behavior of `__validateRpcClass`, the runtime half of a validated
+// class. It must wrap declared methods in place on the class's prototype
+// rather than Proxy-wrapping instances: native (workerd) RPC refuses Proxy
+// targets, and a validated subclass of a validated base must resolve
+// subclass-only methods against the subclass validator. Regression tests for
+// the GitHubPullRequestImpl-extends-GitHubIssueImpl failure ("X is not in the
+// generated validator").
 
 import { describe, expect, it } from "vitest";
 import {
@@ -43,22 +43,22 @@ describe("__validateRpcClass prototype wrapping", () => {
       serviceName: "Svc",
       methods: { ping: { args: [], returns: v.string } },
     };
-    const Decorated = __validateRpcClass(validator)(Svc);
+    const Wrapped = __validateRpcClass(validator)(Svc);
 
-    let instance = new Decorated();
+    let instance = new Wrapped();
     // The old implementation returned a Proxy from the constructor, so the
     // value you got from `new` was not the `this` the constructor saw, and
     // the prototype chain gained a synthetic subclass.
     expect(instance).toBe(captured);
-    expect(Object.getPrototypeOf(instance)).toBe(Decorated.prototype);
+    expect(Object.getPrototypeOf(instance)).toBe(Wrapped.prototype);
     expect(instance instanceof Svc).toBe(true);
     // `#` field access works because methods run on the real instance.
     await expect(instance.ping()).resolves.toBe("pong");
     // The prototype method is the validated wrapper.
-    expect(isWrappedMethod(Decorated.prototype.ping)).toBe(true);
+    expect(isWrappedMethod(Wrapped.prototype.ping)).toBe(true);
   });
 
-  it("decorated subclass of a decorated base resolves subclass-only methods", async () => {
+  it("validated subclass of a validated base resolves subclass-only methods", async () => {
     class IssueImpl {
       #title = "hello title";
       async getTitle(): Promise<string> {
@@ -127,7 +127,7 @@ describe("__validateRpcClass prototype wrapping", () => {
     );
   });
 
-  it("does not double-validate inherited methods or double decoration", async () => {
+  it("does not double-validate inherited methods or double wrapping", async () => {
     let counter = { calls: 0 };
     let arg = countingString(counter);
 
@@ -154,7 +154,7 @@ describe("__validateRpcClass prototype wrapping", () => {
     await expect(sub.echo("x")).resolves.toBe("x");
     expect(counter.calls).toBe(1);
 
-    // Decorating the same class twice is also a no-op the second time.
+    // Wrapping the same class twice is also a no-op the second time.
     counter.calls = 0;
     const Twice = __validateRpcClass(baseValidator)(
       __validateRpcClass(baseValidator)(
@@ -176,14 +176,14 @@ describe("__validateRpcClass prototype wrapping", () => {
         return this.#title;
       }
     }
-    const Decorated = __validateRpcClass({
+    const Wrapped = __validateRpcClass({
       serviceName: "WithGetter",
       methods: { title: { args: [], returns: v.string, isGetter: true } },
     })(WithGetter);
 
-    let instance = new Decorated();
+    let instance = new Wrapped();
     expect(instance.title).toBe("hello");
-    let desc = Object.getOwnPropertyDescriptor(Decorated.prototype, "title");
+    let desc = Object.getOwnPropertyDescriptor(Wrapped.prototype, "title");
     expect(isWrappedMethod(desc?.get)).toBe(true);
   });
 
@@ -202,15 +202,15 @@ describe("__validateRpcClass prototype wrapping", () => {
         return "helped";
       }
     }
-    const Decorated = __validateRpcClass({
+    const Wrapped = __validateRpcClass({
       serviceName: "WithHelper",
       methods: { declared: { args: [], returns: v.string } },
     })(WithHelper);
 
-    let instance = new Decorated();
+    let instance = new Wrapped();
     await expect(instance.declared()).resolves.toBe("helped");
     expect(instance.helper()).toBe("helped");
-    expect(isWrappedMethod(Decorated.prototype.helper)).toBe(false);
+    expect(isWrappedMethod(Wrapped.prototype.helper)).toBe(false);
   });
 
   it("wrapServerTarget passes through already-wrapped methods without re-validating", async () => {
@@ -226,11 +226,11 @@ describe("__validateRpcClass prototype wrapping", () => {
       serviceName: "Svc",
       methods: { echo: { args: [arg], returns: v.string } },
     };
-    const Decorated = __validateRpcClass(validator)(Svc);
+    const Wrapped = __validateRpcClass(validator)(Svc);
 
-    // A decorated instance handed to a session entry point (which wraps its
+    // A wrapped instance handed to a session entry point (which wraps its
     // localMain in wrapServerTarget) must not validate args twice.
-    let wrapped = wrapServerTarget(new Decorated(), validator) as Svc;
+    let wrapped = wrapServerTarget(new Wrapped(), validator) as Svc;
     await expect(wrapped.echo("x")).resolves.toBe("x");
     expect(counter.calls).toBe(1);
   });
