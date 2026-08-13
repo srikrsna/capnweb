@@ -27,6 +27,9 @@ The following types can be passed over RPC, in arguments or return values:
 - `RegExp`
 - `Headers`, `Request`, and `Response` from the Fetch API
 
+A `Set` cannot contain a promise, stub, or `Blob` directly when sent over a connection. These values
+may still appear inside a plain object or array used as a set element.
+
 ## Passed by reference
 
 - Classes that extend [`RpcTarget`](/concepts/rpc-target/)
