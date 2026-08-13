@@ -3,7 +3,8 @@
 //     https://opensource.org/license/mit
 
 import {
-  StubHook, RpcPayload, PropertyPath, ErrorStubHook, PayloadStubHook, PromiseStubHook, streamImpl
+  StubHook, RpcPayload, PropertyPath, ErrorStubHook, PayloadStubHook, PromiseStubHook, streamImpl,
+  NOOP_UNSUBSCRIBE
 } from "./core.js";
 
 // =======================================================================================
@@ -115,9 +116,10 @@ class WritableStreamStubHook extends StubHook {
     }
   }
 
-  onBroken(callback: (error: any) => void): void {
+  onBroken(callback: (error: any) => void): () => void {
     // WritableStream stubs don't really have a "broken" state in the same way.
     // The caller would notice when write/close/abort fails.
+    return NOOP_UNSUBSCRIBE;
   }
 }
 
@@ -517,8 +519,9 @@ class ReadableStreamStubHook extends StubHook {
     }
   }
 
-  onBroken(callback: (error: any) => void): void {
+  onBroken(callback: (error: any) => void): () => void {
     // ReadableStream stubs don't have a "broken" state.
+    return NOOP_UNSUBSCRIBE;
   }
 }
 

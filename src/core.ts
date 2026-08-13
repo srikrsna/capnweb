@@ -48,6 +48,9 @@ const AsyncFunction = (async function () {}).constructor;
 let BUFFER_PROTOTYPE: object | undefined =
     typeof Buffer !== "undefined" ? Buffer.prototype : undefined;
 
+export const NOOP_UNSUBSCRIBE = () => {};
+NOOP_UNSUBSCRIBE[Symbol.dispose] = NOOP_UNSUBSCRIBE
+
 export function typeForRpc(value: unknown): TypeForRpc {
   switch (typeof value) {
     case "boolean":
@@ -312,7 +315,7 @@ export abstract class StubHook {
   // a disposed payload) or it may reject. It's safe to call dispose() multiple times.
   abstract dispose(): void;
 
-  abstract onBroken(callback: (error: any) => void): void;
+  abstract onBroken(callback: (error: any) => void): () => void;
 }
 
 export class ErrorStubHook extends StubHook {
@@ -325,13 +328,14 @@ export class ErrorStubHook extends StubHook {
   pull(): RpcPayload | Promise<RpcPayload> { return Promise.reject(this.error); }
   ignoreUnhandledRejections(): void {}
   dispose(): void {}
-  onBroken(callback: (error: any) => void): void {
+  onBroken(callback: (error: any) => void): () => void {
     try {
       callback(this.error);
     } catch (err) {
       // Don't throw back into the RPC system. Treat this as an unhandled rejection.
       Promise.resolve(err);
     }
+    return NOOP_UNSUBSCRIBE;
   }
 };
 
@@ -519,8 +523,10 @@ export class RpcStub extends RpcTarget {
     }
   }
 
-  onRpcBroken(callback: (error: any) => void) {
-    this[RAW_STUB].hook.onBroken(callback);
+  onRpcBroken(callback: (error: any) => void): Disposable & (() => void) {
+    const unsub = this[RAW_STUB].hook.onBroken(callback);
+    (<any>unsub)[Symbol.dispose] = unsub;
+    return <Disposable & (() => void)>unsub;
   }
 
   map(func: (value: RpcPromise) => unknown): RpcPromise {
@@ -1843,17 +1849,18 @@ export class PayloadStubHook extends ValueStubHook {
     }
   }
 
-  onBroken(callback: (error: any) => void): void {
+  onBroken(callback: (error: any) => void): Disposable & (() => void) {
     if (this.payload) {
       if (this.payload.value instanceof RpcStub) {
         // Payload is a single stub, we should forward onRpcBroken to it.
         // TODO: Consider prohibiting PayloadStubHook created around a single stub; should always
         //   use the underlying stub's hook instead?
-        this.payload.value.onRpcBroken(callback);
+        return this.payload.value.onRpcBroken(callback);
       }
 
       // TODO: Should native stubs be able to implement onRpcBroken?
     }
+    return NOOP_UNSUBSCRIBE
   }
 }
 
@@ -1964,8 +1971,9 @@ class TargetStubHook extends ValueStubHook {
     }
   }
 
-  onBroken(callback: (error: any) => void): void {
+  onBroken(callback: (error: any) => void): () => void {
     // TODO: Should RpcTargets be able to implement onRpcBroken?
+    return NOOP_UNSUBSCRIBE
   }
 }
 
@@ -2067,13 +2075,25 @@ export class PromiseStubHook extends StubHook {
     }
   }
 
-  onBroken(callback: (error: any) => void): void {
+  onBroken(callback: (error: any) => void): () => void {
     if (this.resolution) {
-      this.resolution.onBroken(callback);
+      return this.resolution.onBroken(callback);
     } else {
+      // We don't know where to forward the registration until the promise settles, so remember
+      // whether the caller unsubscribed in the meantime.
+      let unsub: (() => void) | undefined;
+      let unsubscribed = false;
       this.promise.then(hook => {
-        hook.onBroken(callback);
-      }, callback);
+        if (unsubscribed) return;
+        unsub = hook.onBroken(callback);
+      }, error => {
+        if (unsubscribed) return;
+        callback(error);
+      });
+      return () => {
+        unsubscribed = true;
+        if (unsub) unsub();
+      }
     }
   }
 }

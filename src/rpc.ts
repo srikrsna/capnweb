@@ -2,7 +2,7 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { StubHook, RpcPayload, RpcStub, PropertyPath, PayloadStubHook, ErrorStubHook, RpcTarget, unwrapStubAndPath, streamImpl } from "./core.js";
+import { StubHook, RpcPayload, RpcStub, PropertyPath, PayloadStubHook, ErrorStubHook, RpcTarget, unwrapStubAndPath, streamImpl, NOOP_UNSUBSCRIBE } from "./core.js";
 import { Devaluator, Evaluator, ExportId, ImportId, Exporter, Importer, serialize, EncodingLevel, RpcLimits, DEFAULT_LIMITS } from "./serialize.js";
 
 /**
@@ -198,6 +198,9 @@ class ImportTableEntry {
   // List of integer indexes into session.onBrokenCallbacks which are callbacks handed off to 
   // resolution but retained to preserve registration order.
   private retainedOnBrokenRegistrations?: number[];
+  // Map of forwarded registrations with their unsubscribe callbacks keyed to
+  // their original index in onBrokenRegistrations.
+  private forwardedOnBrokenUnsubs?: Map<number, () => void>;
 
   resolve(resolution: StubHook) {
     // TODO: Need embargo handling here? PayloadStubHook needs to be wrapped in a
@@ -223,7 +226,7 @@ class ImportTableEntry {
       for (let i of this.onBrokenRegistrations) {
         let callback = this.session.onBrokenCallbacks[i];
         let endIndex = this.session.onBrokenCallbacks.length;
-        resolution.onBroken(callback);
+        let unsub = resolution.onBroken(callback);
         if (this.session.onBrokenCallbacks[endIndex] === callback) {
           // Oh, calling onBroken() just registered the callback back on this connection again.
           // But when the connection dies, we want all the callbacks to be called in the order in
@@ -237,6 +240,7 @@ class ImportTableEntry {
         } else {
           // The callback is now registered elsewhere, so delete it from our session.
           delete this.session.onBrokenCallbacks[i];
+          (this.forwardedOnBrokenUnsubs ??= new Map()).set(i, unsub);
         }
       }
       this.onBrokenRegistrations = undefined;
@@ -291,15 +295,35 @@ class ImportTableEntry {
     }
   }
 
-  onBroken(callback: (error: any) => void): void {
+  onBroken(callback: (error: any) => void): () => void {
     if (this.resolution) {
-      this.resolution.onBroken(callback);
+      return this.resolution.onBroken(callback);
     } else {
       let index = this.session.onBrokenCallbacks.length;
       this.session.onBrokenCallbacks.push(callback);
 
       if (!this.onBrokenRegistrations) this.onBrokenRegistrations = [];
       this.onBrokenRegistrations.push(index);
+      return () => {
+        if (this.onBrokenRegistrations) {
+          let i = this.onBrokenRegistrations.indexOf(index);
+          if (i >= 0) {
+            delete this.session.onBrokenCallbacks[index];
+            this.onBrokenRegistrations.splice(i, 1);
+          }
+          return;
+        }
+        if (this.retainedOnBrokenRegistrations) {
+          let i = this.retainedOnBrokenRegistrations.indexOf(index);
+          if (i >= 0) {
+            delete this.session.onBrokenCallbacks[index];
+            this.retainedOnBrokenRegistrations.splice(i, 1);
+            return;
+          }
+        }
+        // This was passed on to the resolution.
+        this.forwardedOnBrokenUnsubs?.get(index)?.();
+      }
     }
   }
 
@@ -418,10 +442,11 @@ class RpcImportHook extends StubHook {
     }
   }
 
-  onBroken(callback: (error: any) => void): void {
+  onBroken(callback: (error: any) => void): () => void {
     if (this.entry) {
-      this.entry.onBroken(callback);
+      return this.entry.onBroken(callback);
     }
+    return NOOP_UNSUBSCRIBE;
   }
 }
 

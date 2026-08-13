@@ -2219,6 +2219,174 @@ describe("onRpcBroken", () => {
 
     expect(fired).toStrictEqual(["live:test disconnect"]);
   });
+
+  it("returns an unsubscribe callback which cancels the registration", async () => {
+    class BrokenTest extends RpcTarget {
+      makeCounter() { return new Counter(0); }
+    }
+
+    // Intentionally don't use `using` here because we expect the stats to be wrong after a
+    // disconnect.
+    let harness = new TestHarness(new BrokenTest());
+    let stub = harness.stub;
+
+    let fired: string[] = [];
+    let unsubA = stub.onRpcBroken(() => { fired.push("a"); });
+    stub.onRpcBroken(() => { fired.push("b"); });
+    let unsubC = stub.onRpcBroken(() => { fired.push("c"); });
+    stub.onRpcBroken(() => { fired.push("d"); });
+
+    unsubA();
+    unsubC();
+
+    // Unsubscribing more than once is harmless.
+    unsubA();
+
+    harness.clientTransport.forceReceiveError(new Error("test disconnect"));
+    await pumpMicrotasks();
+
+    // Only the live registrations fire, and they still fire in registration order.
+    expect(fired).toStrictEqual(["b", "d"]);
+  });
+
+  it("supports unsubscribing with `using`", async () => {
+    class BrokenTest extends RpcTarget {
+      makeCounter() { return new Counter(0); }
+    }
+
+    let harness = new TestHarness(new BrokenTest());
+    let stub = harness.stub;
+
+    let fired: string[] = [];
+
+    {
+      using _scoped = stub.onRpcBroken(() => { fired.push("scoped"); });
+      expect(await stub.makeCounter()).toBeDefined();
+    }
+
+    stub.onRpcBroken(error => { fired.push(`live:${error.message}`); });
+
+    harness.clientTransport.forceReceiveError(new Error("test disconnect"));
+    await pumpMicrotasks();
+
+    expect(fired).toStrictEqual(["live:test disconnect"]);
+  });
+
+  it("ignores unsubscribe calls made after the break", async () => {
+    class BrokenTest extends RpcTarget {
+      getValue() { return 42; }
+    }
+
+    let harness = new TestHarness(new BrokenTest());
+    let stub = harness.stub;
+
+    let fired: string[] = [];
+    let unsub = stub.onRpcBroken(error => { fired.push(error.message); });
+
+    harness.clientTransport.forceReceiveError(new Error("test disconnect"));
+    await pumpMicrotasks();
+    expect(fired).toStrictEqual(["test disconnect"]);
+
+    // Unsubscribing after the fact neither throws nor re-fires anything.
+    unsub();
+    unsub[Symbol.dispose]();
+    await pumpMicrotasks();
+    expect(fired).toStrictEqual(["test disconnect"]);
+  });
+
+  it("returns a no-op unsubscribe when the stub is already broken", async () => {
+    await using harness = new TestHarness(new TestTarget());
+
+    let promise = harness.stub.throwError();
+    await promise.catch(() => {});
+
+    let fired: string[] = [];
+    // Already broken, so the callback fires immediately and there is nothing to unsubscribe.
+    let unsub = promise.onRpcBroken(error => { fired.push(error.message); });
+    expect(fired).toStrictEqual(["test error"]);
+
+    expect(() => unsub()).not.toThrow();
+    expect(fired).toStrictEqual(["test error"]);
+  });
+
+  it("unsubscribes a registration that migrated to a promise's resolution", async () => {
+    class BrokenTest extends RpcTarget {
+      makeCounter() { return new Counter(0); }
+    }
+
+    let harness = new TestHarness(new BrokenTest());
+    let stub = harness.stub;
+
+    let fired: string[] = [];
+
+    let counterPromise = stub.makeCounter();
+    let unsub = counterPromise.onRpcBroken(() => { fired.push("promise"); });
+
+    // Awaiting resolves the import, which migrates the registration to the resolution while
+    // keeping the original session slot. Unsubscribing has to find it there.
+    using counter = await counterPromise;
+    expect(await counter.increment(1)).toBe(1);
+
+    unsub();
+
+    stub.onRpcBroken(error => { fired.push(`live:${error.message}`); });
+
+    harness.clientTransport.forceReceiveError(new Error("test disconnect"));
+    await pumpMicrotasks();
+
+    expect(fired).toStrictEqual(["live:test disconnect"]);
+  });
+
+  it("unsubscribes a registration that the resolution didn't keep", async () => {
+    // The promise resolves to a plain value, so the resolution has nothing to break and drops the
+    // registration instead of re-registering it on the session. Unsubscribing must still be safe.
+    class BrokenTest extends RpcTarget {
+      getValue() { return 42; }
+    }
+
+    let harness = new TestHarness(new BrokenTest());
+    let stub = harness.stub;
+
+    let fired: string[] = [];
+
+    let promise = stub.getValue();
+    let unsub = promise.onRpcBroken(() => { fired.push("value"); });
+    expect(await promise).toBe(42);
+
+    expect(() => unsub()).not.toThrow();
+
+    stub.onRpcBroken(error => { fired.push(`live:${error.message}`); });
+
+    harness.clientTransport.forceReceiveError(new Error("test disconnect"));
+    await pumpMicrotasks();
+
+    expect(fired).toStrictEqual(["live:test disconnect"]);
+  });
+
+  it("unsubscribes from a local promise that hasn't settled yet", async () => {
+    // No RPC session involved: the hook is a promise hook that only learns where to forward the
+    // registration once it settles, so unsubscribing before that has to be remembered.
+    class SlowFailure extends RpcTarget {
+      async failLater(): Promise<Counter> {
+        await new Promise<void>(resolve => setTimeout(resolve, 0));
+        throw new Error("late failure");
+      }
+    }
+
+    let stub = new RpcStub(new SlowFailure());
+
+    let fired: string[] = [];
+    let promise = stub.failLater();
+    let unsub = promise.onRpcBroken(() => { fired.push("unsubscribed"); });
+    promise.onRpcBroken(error => { fired.push(`live:${error.message}`); });
+
+    unsub();
+
+    await expect(() => promise).rejects.toThrow("late failure");
+    await pumpMicrotasks();
+
+    expect(fired).toStrictEqual(["live:late failure"]);
+  });
 });
 
 // =======================================================================================
