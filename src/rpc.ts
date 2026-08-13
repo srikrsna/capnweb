@@ -195,6 +195,9 @@ class ImportTableEntry {
   // List of integer indexes into session.onBrokenCallbacks which are callbacks registered on
   // this import. Initialized on first use (so `undefined` is the same as an empty list).
   private onBrokenRegistrations?: number[];
+  // List of integer indexes into session.onBrokenCallbacks which are callbacks handed off to 
+  // resolution but retained to preserve registration order.
+  private retainedOnBrokenRegistrations?: number[];
 
   resolve(resolution: StubHook) {
     // TODO: Need embargo handling here? PayloadStubHook needs to be wrapped in a
@@ -228,6 +231,9 @@ class ImportTableEntry {
           // here. So, let's remove the newly-added registration and keep the original.
           // TODO: This is quite hacky, think about whether this is really the right answer.
           delete this.session.onBrokenCallbacks[endIndex];
+          // We have to dispose the callbacks when this entry is disposed, the resolution cannot keep
+          // track of this because of the index swap.
+          (this.retainedOnBrokenRegistrations ??= []).push(i);
         } else {
           // The callback is now registered elsewhere, so delete it from our session.
           delete this.session.onBrokenCallbacks[i];
@@ -254,6 +260,11 @@ class ImportTableEntry {
   dispose() {
     if (this.resolution) {
       this.resolution.dispose();
+      if (this.retainedOnBrokenRegistrations) {
+        for (let i of this.retainedOnBrokenRegistrations) {
+          delete this.session.onBrokenCallbacks[i];
+        }
+      }
     } else {
       this.abort(new Error("RPC was canceled because the RpcPromise was disposed."));
       this.sendRelease();
@@ -271,7 +282,12 @@ class ImportTableEntry {
 
       // The RpcSession itself will have called all our callbacks so we don't need to track the
       // registrations anymore.
-      this.onBrokenRegistrations = undefined;
+      if (this.onBrokenRegistrations) {
+        for (let i of this.onBrokenRegistrations) {
+          delete this.session.onBrokenCallbacks[i];
+        }
+        this.onBrokenRegistrations = undefined;
+      }
     }
   }
 

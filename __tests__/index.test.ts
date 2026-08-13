@@ -2174,6 +2174,51 @@ describe("onRpcBroken", () => {
       {which: "hangingCall", error: new Error("test disconnect")},
     ]);
   });
+
+  it("forgets callbacks registered on stubs that were disposed before the break", async () => {
+    // Regression test for https://github.com/cloudflare/capnweb/issues/210. Disposing an import
+    // used to clear its own registration list without removing the callbacks from the
+    // session-wide list, so each callback stayed reachable for the life of the session and then
+    // fired at teardown with the teardown error.
+    class BrokenTest extends RpcTarget {
+      makeCounter() { return new Counter(0); }
+    }
+
+    // Intentionally don't use `using` here because we expect the stats to be wrong after a
+    // disconnect.
+    let harness = new TestHarness(new BrokenTest());
+    let stub = harness.stub;
+
+    let fired: string[] = [];
+
+    // An ordinary imported capability. Its import entry never gets a resolution, so disposal
+    // goes through abort() and release.
+    {
+      using counter = await stub.makeCounter();
+      counter.onRpcBroken(() => { fired.push("disposedStub"); });
+      expect(await counter.increment(1)).toBe(1);
+    }
+
+    // A promise that resolves to an import on this same session. resolve() migrates the
+    // registration to the resolution but keeps the original session slot, which is a second
+    // disposal path.
+    {
+      using counterPromise = stub.makeCounter();
+      counterPromise.onRpcBroken(() => { fired.push("disposedPromise"); });
+      expect(await counterPromise.increment(1)).toBe(1);
+    }
+
+    // This registration is still live at teardown, so it must fire even after the removals above.
+    stub.onRpcBroken(error => { fired.push(`live:${error.message}`); });
+
+    await pumpMicrotasks();
+    expect(fired).toStrictEqual([]);
+
+    harness.clientTransport.forceReceiveError(new Error("test disconnect"));
+    await pumpMicrotasks();
+
+    expect(fired).toStrictEqual(["live:test disconnect"]);
+  });
 });
 
 // =======================================================================================
