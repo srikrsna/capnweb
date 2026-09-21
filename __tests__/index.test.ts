@@ -1582,21 +1582,15 @@ describe("promise pipelining", () => {
   });
 });
 
-describe("promises, stubs and Blobs inside a Set", () => {
-  // A Set carries plain data only: no promises, stubs or Blobs as elements. A promise or Blob is
-  // delivered by substituting the value into its parent, i.e. `parent[property] = value`, and a Set
-  // has no property that names an element. Rather than mutate the Set behind the application's
-  // back, we reject it. Stubs are excluded along with them so a Set behaves the same in both
-  // directions. These tests pin that down on the send path (Devaluator), the local path
-  // (RpcPayload.deepCopy), and the receive path (Evaluator).
-  //
-  // Each path converts the element first and then checks what came back, instead of inspecting the
-  // element's type up front. That's why a Blob or stub is rejected over a connection but allowed on
-  // a local call, where nothing is encoded.
+describe("promises and Blobs inside a Set", () => {
+  // A promise or Blob is delivered by substituting the value into its parent, i.e.
+  // `parent[property] = value`, and a Set has no property that names an element. Rather than mutate
+  // the Set behind the application's back, we reject it. Stubs need no substitution and remain
+  // valid Set elements.
   const PROMISE_ERROR = "Cannot serialize a promise as an element of a Set";
+  const LOCAL_PROMISE_ERROR = "Cannot pass a promise as an element of a Set";
   const BLOB_ERROR = "Cannot serialize a Blob as an element of a Set";
-  const DESERIALIZE_ERROR = "Cannot deserialize a stub or promise as an element of a Set";
-  const STUB_ERROR = "Cannot serialize a stub as an element of a Set";
+  const DESERIALIZE_ERROR = "Cannot deserialize a promise as an element of a Set";
 
   class SetTarget extends RpcTarget {
     square(i: number) {
@@ -1662,25 +1656,37 @@ describe("promises, stubs and Blobs inside a Set", () => {
   });
 
   it("rejects a promise in a Set passed to a local stub", async () => {
-    using stub = new RpcStub(new SetTarget());
-    using promise = stub.square(3);
-    let source = new Set<unknown>(["alpha", promise, "omega"]);
+    let targetDisposed = false;
+    class DisposableCounter extends Counter {
+      [Symbol.dispose]() { targetDisposed = true; }
+    }
 
-    // The local path copies at delivery time, so this surfaces as a rejection.
-    await expect(() => stub.inspect(source)).rejects.toThrow(PROMISE_ERROR);
+    {
+      using stub = new RpcStub(new SetTarget());
+      using counter = new RpcStub(new DisposableCounter(5));
+      using promise = stub.square(3);
+      let source = new Set<unknown>(["alpha", counter, promise, "omega"]);
 
-    // The caller's Set is left exactly as it was.
-    expect([...source]).toStrictEqual(["alpha", promise, "omega"]);
-    expect(Object.getOwnPropertyNames(source)).toStrictEqual([]);
+      // The local path copies at delivery time, so this surfaces as a rejection.
+      await expect(() => stub.inspect(source)).rejects.toThrow(LOCAL_PROMISE_ERROR);
+
+      // The caller's Set is left exactly as it was.
+      expect([...source]).toStrictEqual(["alpha", counter, promise, "omega"]);
+      expect(Object.getOwnPropertyNames(source)).toStrictEqual([]);
+    }
+
+    // The failed partial copy must not retain its duplicate of the preceding stub.
+    expect(targetDisposed).toBe(true);
   });
 
   it("rejects a Blob sent inside a Set", async () => {
     await using harness = new TestHarness(new SetTarget());
+    let stream = new ReadableStream();
 
-    // Caught while encoding, before the Blob's pipe is created. The harness checks at the end of
-    // the test that no import or export leaked, which is what creating the pipe and then throwing
-    // would do.
-    expect(() => harness.stub.inspect(new Set<unknown>([new Blob(["hello"])]))).toThrow(BLOB_ERROR);
+    // All elements are validated before encoding starts, so neither this preceding stream nor the
+    // Blob creates a pipe. The harness checks at the end of the test that no import leaked.
+    expect(() => harness.stub.inspect(new Set<unknown>([stream, new Blob(["hello"])])))
+        .toThrow(BLOB_ERROR);
   });
 
   it("rejects a Blob in a Set returned to the caller", async () => {
@@ -1720,37 +1726,38 @@ describe("promises, stubs and Blobs inside a Set", () => {
     expect(result.strayProps).toStrictEqual([]);
   });
 
-  it("rejects a stub sent inside a Set", async () => {
+  it("accepts a stub sent inside a Set", async () => {
     await using harness = new TestHarness(new SetTarget());
     using counter = new RpcStub(new Counter(5));
 
-    // A Set holds plain data only, so a stub the sender owns is out too. It encodes as ["export"].
-    expect(() => harness.stub.incrementAll(new Set<unknown>([counter]))).toThrow(STUB_ERROR);
+    expect(await harness.stub.incrementAll(new Set<unknown>([counter])))
+        .toStrictEqual({isSet: true, results: [6]});
   });
 
-  it("rejects a stub pointing back at the peer inside a Set", async () => {
+  it("accepts a stub pointing back at the peer inside a Set", async () => {
     await using harness = new TestHarness(new SetTarget());
 
-    // The other encoding of a stub: this one is the peer's own capability, so it goes out as
-    // ["import"] rather than ["export"].
     using counter = await harness.stub.makeCounter(5);
 
-    expect(() => harness.stub.incrementAll(new Set<unknown>([counter]))).toThrow(STUB_ERROR);
+    expect(await harness.stub.incrementAll(new Set<unknown>([counter])))
+        .toStrictEqual({isSet: true, results: [6]});
   });
 
-  it("rejects a stub in a Set returned to the caller", async () => {
+  it("accepts a stub in a Set returned to the caller", async () => {
     await using harness = new TestHarness(new SetTarget());
     using counter = new RpcStub(new Counter(5));
 
-    // Caught by the server as it serializes its result, and reported as the call's rejection.
-    await expect(() => harness.stub.bounce(counter)).rejects.toThrow(STUB_ERROR);
+    using result = await harness.stub.bounce(counter);
+
+    // The returned stub remains a stub when the Set is sent over the wire again.
+    expect(await harness.stub.incrementAll(result))
+        .toStrictEqual({isSet: true, results: [6]});
   });
 
   it("accepts a stub in a Set passed to a local stub", async () => {
     using stub = new RpcStub(new SetTarget());
     using counter = new RpcStub(new Counter(5));
 
-    // Same leniency as a Blob on this path: nothing is encoded, so the app just gets the stub.
     expect(await stub.incrementAll(new Set<unknown>([counter])))
         .toStrictEqual({isSet: true, results: [6]});
   });

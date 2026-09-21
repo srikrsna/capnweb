@@ -1078,15 +1078,20 @@ export class RpcPayload {
         // We have to construct the new set first, then fill it in, so we can pass it as the
         // parent.
         let set = <Set<unknown>>value;
-        let result = new Set();
-        let index = 0;
-        for (let val of set) {
-          let copy = this.deepCopy(val, set, index++, result, dupStubs, owner);
-          if (copy instanceof RpcPromise) {
+        let elements = [...set];
+        for (let val of elements) {
+          let kind = typeForRpc(val);
+          if (kind === "rpc-promise" || kind === "rpc-thenable") {
             throw new TypeError(
-                "Cannot serialize a promise as an element of a Set. Await the value before " +
+                "Cannot pass a promise as an element of a Set. Await the value before " +
                 "adding it to the Set.");
           }
+        }
+
+        let result = new Set();
+        let index = 0;
+        for (let val of elements) {
+          let copy = this.deepCopy(val, set, index++, result, dupStubs, owner);
           result.add(copy);
         }
         return result;
@@ -1225,7 +1230,12 @@ export class RpcPayload {
       try {
         this.value = this.deepCopy(this.value, undefined, "value", this, dupStubs, this);
       } catch (err) {
-        // Roll back the change.
+        // Roll back duplicates accumulated while copying params. Return values transfer ownership,
+        // so their original structure remains responsible for disposal on this error path.
+        if (dupStubs) {
+          this.hooks.forEach(hook => hook.dispose());
+          this.promises.forEach(promise => promise.promise[Symbol.dispose]());
+        }
         this.hooks = undefined;
         this.promises = undefined;
         throw err;
